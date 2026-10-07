@@ -17,6 +17,7 @@ S3 bucket on a local emulator**, so no cloud account is needed.
 - [Quick start](#quick-start)
 - [The policies](#the-policies)
 - [Module versioning](#module-versioning)
+- [Trying it on real AWS (untested)](#trying-it-on-real-aws-untested)
 - [Project layout](#project-layout)
 - [Known limits](#known-limits)
 
@@ -105,6 +106,87 @@ source = "git::https://github.com/miguelmora76/terraform-policy-demo.git//module
 
 `live/` uses a relative path so the demo changes and the module move together.
 
+## Trying it on real AWS (untested)
+
+**None of this has been run.** There is no AWS account behind this project; the steps below are what I would
+do, and they are the honest list of what the emulator does *not* prove. Use a throwaway sandbox account, never a
+shared or production one, and set a budget alert first.
+
+**1. Credentials.** Use short-lived credentials: `aws sso login --profile sandbox && export AWS_PROFILE=sandbox`
+locally, and GitHub OIDC in CI (step 7). No long-lived access keys, and the fake `test`/`test` keys must not be
+used.
+
+**2. Create the state bucket once, outside Terraform** (a backend can't create its own bucket). Pick a globally
+unique name:
+
+```bash
+BUCKET=my-unique-tf-state-bucket; REGION=us-east-1
+aws s3api create-bucket --bucket "$BUCKET" --region "$REGION"   # outside us-east-1 add --create-bucket-configuration LocationConstraint=$REGION
+aws s3api put-bucket-versioning --bucket "$BUCKET" --versioning-configuration Status=Enabled
+aws s3api put-bucket-encryption --bucket "$BUCKET" --server-side-encryption-configuration \
+  '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+aws s3api put-public-access-block --bucket "$BUCKET" --public-access-block-configuration \
+  BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+```
+
+**3. Point the backend at it.** Add `live/backend.aws.hcl` and use it instead of `backend.local.hcl`. There is no
+`endpoints`, no keys and no `skip_*` flags:
+
+```hcl
+bucket       = "my-unique-tf-state-bucket"
+key          = "terraform-policy-demo/live.tfstate"
+region       = "us-east-1"
+encrypt      = true
+use_lockfile = true   # native S3 locking; needs no DynamoDB table
+```
+
+**4. Change the provider block in `live/main.tf`.** Remove `access_key`, `secret_key`, every `skip_*` flag,
+`s3_use_path_style` and the `endpoints` block, and delete the `s3_endpoint` variable. What is left is
+`provider "aws" { region = "us-east-1" }`; credentials come from the environment.
+
+**5. Make the bucket name unique.** S3 names are global. `demo-app-logs` in `live/main.tf` will almost certainly be
+taken, so use something like `demo-app-logs-<account-id>`. Both the module and the policies are name-agnostic.
+
+**6. Give the identity the permissions it needs** (a least-privilege role, not `AdministratorAccess`):
+
+| Where | Actions |
+|---|---|
+| State bucket | `s3:ListBucket`, and `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` on the state key and its `.tflock` file |
+| Demo bucket | `s3:CreateBucket`, `s3:DeleteBucket`, `s3:ListBucket`, `s3:GetBucket*`, `s3:PutBucketTagging`, `s3:PutBucketVersioning`, `s3:PutEncryptionConfiguration`, `s3:PutBucketPublicAccessBlock`, `s3:PutLifecycleConfiguration` |
+
+**7. Adapt the pipeline.** `scripts/check_policy.sh` applies the baseline on every run, which is right for an
+emulator that starts empty and wrong for a real account. For AWS, split it:
+
+- *Pull request:* `terraform init -backend-config=backend.aws.hcl`, then **plan only**, `terraform show -json`, then
+  `conftest test`. Never apply from a PR. Authenticate with `aws-actions/configure-aws-credentials` using
+  `role-to-assume` and `permissions: id-token: write` (an IAM role that trusts GitHub's OIDC provider for this repo).
+- *Merge to `main`:* apply the reviewed plan, ideally behind a GitHub Environment with required reviewers.
+- Keep `terraform test` as it is; it uses a mocked provider and needs no credentials.
+
+**8. Run it once by hand before wiring CI.**
+
+```bash
+cd live
+terraform init -backend-config=backend.aws.hcl
+terraform apply                                   # the baseline bucket
+terraform plan -var-file=changes/allowed.tfvars -out=a.tfplan && terraform show -json a.tfplan > a.json
+conftest test a.json -p ../policy                 # expect: pass
+terraform plan -var-file=changes/blocked.tfvars -out=b.tfplan && terraform show -json b.tfplan > b.json
+conftest test b.json -p ../policy                 # expect: S3-001 failures; do NOT apply b.tfplan
+```
+
+**9. Check what the emulator could not.** Confirm real AWS state matches what the module claims:
+`aws s3api get-bucket-encryption`, `get-public-access-block`, `get-bucket-versioning`, `get-bucket-tagging` and
+`get-bucket-lifecycle-configuration` on the demo bucket, and that the state object and (during a run) its `.tflock`
+exist in the state bucket. Also confirm the plan JSON from real AWS has the same shape the Rego rules expect. The
+rules were written against emulator plans, which come from the same provider, so I expect no difference, but that is
+an expectation, not a result.
+
+**10. Clean up.** `S3-005` blocks destroying a bucket, but only in CI on a plan, so a local
+`terraform destroy` still works (empty the bucket first, since `force_destroy` is off). Then delete the state
+bucket by hand, remove its versions as well, and delete the IAM role. Everything here costs cents at most, but
+versioned buckets keep old objects until they are removed.
+
 ## Project layout
 
 ```
@@ -117,7 +199,8 @@ scripts/             emulator.sh, check_policy.sh, check_changelog.sh
 
 ## Known limits
 
-- No real AWS account; a local emulator stands in, and the "remote" state is on localhost, in memory.
+- No real AWS account; a local emulator stands in, and the "remote" state is on localhost, in memory. See
+  [Trying it on real AWS](#trying-it-on-real-aws-untested) for what testing it for real would take.
 - The emulator doesn't evaluate IAM or KMS, and the module uses AES256 only (no customer-managed keys).
 - Five small rules for one resource family. A real guardrail set would be broader and would load organization
   data (exemptions, allowed regions) instead of hard-coding.
