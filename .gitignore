@@ -1,0 +1,7 @@
+.venv/
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.plan.json
+.emulator/

@@ -1,0 +1,27 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.16.4
+          terraform_wrapper: false
+      - name: Install conftest
+        run: |
+          curl -fsSL https://github.com/open-policy-agent/conftest/releases/download/v0.71.1/conftest_0.71.1_Linux_x86_64.tar.gz | tar -xz conftest
+          sudo mv conftest /usr/local/bin/
+          conftest --version
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync
+      - name: fmt, validate, terraform test, OPA unit tests, version check, policy demo
+        run: make ci
+      - name: Stop the emulator
+        if: always()
+        run: make emulator-down

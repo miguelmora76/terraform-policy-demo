@@ -1,0 +1,9 @@
+[project]
+name = "terraform-policy-demo"
+version = "0.1.0"
+description = "Local S3 emulator (moto) for the demo's Terraform remote state"
+requires-python = ">=3.12"
+dependencies = ["moto[server,s3]>=5.1"]
+
+[tool.uv]
+package = false
